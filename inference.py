@@ -1,4 +1,5 @@
 import copy
+import sys
 import os
 import torch
 from argparse import ArgumentParser, Namespace, FileType
@@ -64,6 +65,8 @@ parser.add_argument('--gnina_full_dock', action='store_true', default=False, hel
 parser.add_argument('--gnina_autobox_add', type=float, default=4.0)
 parser.add_argument('--gnina_poses_to_optimize', type=int, default=1)
 
+parser.add_argument('--bad_ligands', type=str, default='bad_ligands_log.txt')
+
 args = parser.parse_args()
 
 REPOSITORY_URL = os.environ.get("REPOSITORY_URL", "https://github.com/gcorso/DiffDock")
@@ -77,6 +80,12 @@ if args.config:
                 arg_dict[key].append(v)
         else:
             arg_dict[key] = value
+
+try:
+    bad_ligands_fh = open(args.bad_ligands, 'w', buffering=1)
+except Exception as e:
+    print(f"Cannot open bad-ligand error log {args.bad_ligands}: {e}", file=sys.stderr)
+    sys.exit(1)
 
 # Download models if they don't exist locally
 if not os.path.exists(args.model_dir):
@@ -178,7 +187,25 @@ tr_schedule = get_t_schedule(inference_steps=args.inference_steps, sigma_schedul
 failures, skipped = 0, 0
 N = args.samples_per_complex
 print('Size of test dataset: ', len(test_dataset))
-for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
+
+def try_wrap(gen):
+    idx = None
+    graph = None
+    while True:
+        try:
+            idx, graph = next(gen)
+            print(f"Yielding {idx}")
+            yield idx, graph
+        except StopIteration:
+            print("stopping iteration")
+            break
+        except Exception as e:
+            print(f"Iteration failed for {idx}: {e}")
+            print(f"@Exception\t{complex_name_list[idx]}\t{e}", file=bad_ligands_fh)
+
+#for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
+for idx, orig_complex_graph in tqdm(try_wrap(enumerate(test_loader))):
+    print(f"Running {complex_name_list[idx]}")
     if not orig_complex_graph.success[0]:
         skipped += 1
         print(f"HAPPENING | The test dataset did not contain {test_dataset.complex_names[idx]} for {test_dataset.ligand_descriptions[idx]} and {test_dataset.protein_files[idx]}. We are skipping this complex.")
@@ -198,6 +225,9 @@ for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
                            initial_noise_std_proportion=args.initial_noise_std_proportion,
                            choose_residue=args.choose_residue)
 
+        #print(f"Skipping {complex_name_list[idx]}")
+        #print(orig_complex_graph)
+        #continue;
         lig = orig_complex_graph.mol[0]
 
         # initialize visualisation
@@ -257,8 +287,10 @@ for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
 
     except Exception as e:
         print("Failed on", orig_complex_graph["name"], e)
+        print(f"@BodyException\t{complex_name_list[idx]}\t{e}", file=bad_ligands_fh)
         failures += 1
 
+bad_ligands_fh.close()
 print(f'Failed for {failures} complexes')
 print(f'Skipped {skipped} complexes')
 print(f'Results are in {args.out_dir}')
